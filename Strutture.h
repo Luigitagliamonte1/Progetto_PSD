@@ -81,3 +81,35 @@ typedef enum { LIBERO, PRENOTATO, OCCUPATO } StatoPosto;
 typedef struct {
     int ora, minuti, secondi;
 } OrarioVirtuale;
+
+/* ==========================================================================
+ * TIPI OPACHI (information hiding)
+ * ---------------------------------------------------------------------------
+ * Sono dichiarati come "typedef struct X X;": il compilatore sa che X
+ * esiste ma non ne conosce i campi. Le definizioni complete sono in
+ * funzioni.c. Da fuori si puo' solo manipolarli tramite puntatori e le
+ * funzioni dell'API.
+ * ========================================================================== */
+
+/* TabellaHashStudenti: anagrafica degli studenti (chiave = matricola). */
+typedef struct TabellaHashStudenti TabellaHashStudenti;
+
+/* TurnoAula: stato dell'aula per la fascia oraria corrente (posti + statistiche). */
+typedef struct TurnoAula TurnoAula;
+
+/* CodaAttesa: coda FIFO degli studenti in lista d'attesa. */
+typedef struct CodaAttesa CodaAttesa;
+
+/* Studente: dati anagrafici di un iscritto (matricola, nome, corso). */
+typedef struct Studente Studente;
+
+/* NodoStudente: elemento di una catena nella tabella hash (chaining). */
+typedef struct NodoStudente NodoStudente;
+
+/* Posto: stato di un singolo posto dell'aula. */
+typedef struct Posto Posto;
+
+/* NodoAttesa: elemento della coda d'attesa. */
+typedef struct NodoAttesa NodoAttesa;
+
+#endif /* STRUTTURE_H */
