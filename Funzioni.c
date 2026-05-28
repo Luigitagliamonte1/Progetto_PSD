@@ -440,3 +440,266 @@ void effettua_prenotazione(TabellaHashStudenti* anagrafica, TurnoAula* aula, Cod
  * Post: dimensione coda incrementata di 1; eventuale allocazione fallita
  *       segnalata su stderr (la coda resta invariata).
  */
+void accoda_studente(CodaAttesa* coda, char* matricola, char* data, FasciaOraria fascia) {
+    if (coda == NULL) return;
+
+    NodoAttesa* nuovo = (NodoAttesa*)malloc(sizeof(NodoAttesa));
+    if (nuovo == NULL) {
+        fprintf(stderr, "[ERRORE] Allocazione fallita in accoda_studente\n");
+        return;
+    }
+
+    /* Copia sicura delle stringhe nei campi del nodo (vedi crea_studente
+     * per il motivo della terminazione esplicita). */
+    strncpy(nuovo->matricola, matricola, 11);
+    nuovo->matricola[11] = '\0';
+    strncpy(nuovo->data, data, 10);
+    nuovo->data[10] = '\0';
+
+    nuovo->fascia = fascia;
+    nuovo->next = NULL;
+
+    /* Tail-insert: se la coda e' vuota il nuovo nodo e' anche la testa,
+     * altrimenti viene appeso dopo l'attuale tail. */
+    if (coda->head == NULL) {
+        coda->head = nuovo;
+    } else {
+        coda->tail->next = nuovo;
+    }
+    coda->tail = nuovo;
+    coda->dimensione++;
+
+    printf("[CODA] Studente %s aggiunto alla lista d'attesa (Posizione: %d).\n",
+            matricola, coda->dimensione);
+}
+
+/*
+ * effettua_checkin:
+ *   Registra l'ingresso fisico di uno studente in aula. La logica gestisce
+ *   tutti gli scenari possibili in ordine di priorita':
+ *
+ *     1. Matricola non registrata -> errore.
+ *     2. Lo studente ha gia' un posto PRENOTATO/OCCUPATO -> conferma o
+ *        avviso di doppio check-in.
+ *     3. Lo studente e' in coda per la fascia corrente (prenotazione
+ *        anticipata "maturata") -> viene estratto dalla coda e gli si
+ *        assegna un posto.
+ *     4. Lo studente e' in coda per una fascia futura -> deve aspettare.
+ *     5. Nessuna prenotazione e c'e' un posto libero E la coda e' vuota
+ *        -> ingresso diretto.
+ *     6. Altrimenti -> messo in coda per la fascia corrente.
+ *
+ *   Il controllo sull'ora esatta della fascia e' omesso volutamente:
+ *   l'orario virtuale e' accelerato (1 sec reale = 120 sec virtuali) e
+ *   imporre una validazione stretta produrrebbe falsi negativi. La
+ *   responsabilita' di tenere aperta/chiusa l'aula resta al meccanismo
+ *   di cambio fascia automatico.
+ *
+ * Parametri:
+ *   anagrafica, aula, coda: non NULL.
+ *   matricola: stringa valida.
+ *   ora_attuale: timestamp virtuale per lo storico.
+ *
+ * Pre:  sistema inizializzato.
+ * Post: lo stato dell'aula/coda riflette uno degli scenari sopra elencati;
+ *       l'evento (di qualsiasi tipo) e' registrato nello storico.
+ */
+void effettua_checkin(TabellaHashStudenti* anagrafica, TurnoAula* aula, CodaAttesa* coda, char* matricola, OrarioVirtuale ora_attuale) {
+
+    /* 1. Verifica anagrafica */
+    if (cerca_studente(anagrafica, matricola) == NULL) {
+        printf("[ERRORE] Matricola %s non presente in anagrafica. Registrati prima (Opz. 1).\n", matricola);
+        return;
+    }
+
+    /* 2. Ricerca posto fisico gia' assegnato (PRENOTATO o OCCUPATO) */
+    {
+        int i;
+        for (i = 0; i < MAX_POSTI; i++) {
+            if (aula->posti[i].stato != LIBERO &&
+                strcmp(aula->posti[i].matricola_studente, matricola) == 0) {
+
+                if (aula->posti[i].stato == OCCUPATO) {
+                    /* Doppio check-in: lo studente risulta gia' dentro. */
+                    printf("[AVVISO] Risulti gia' seduto al posto %d.\n", i + 1);
+                    return;
+                }
+                if (aula->posti[i].stato == PRENOTATO) {
+                    /* Caso normale: la prenotazione si materializza in presenza. */
+                    aula->posti[i].stato = OCCUPATO;
+                    aula->totale_checkin++;
+                    aula->accessi_per_fascia[(int)aula->fascia]++;
+                    printf("[CHECK-IN] Prenotazione confermata. Benvenuto al posto %d!\n", i + 1);
+                    salva_storico_accesso(anagrafica, matricola,
+                               (aula->fascia == MATTINA ? "CHECK-IN CON PRENOTAZIONE [MATTINA]"
+                               : aula->fascia == POMERIGGIO ? "CHECK-IN CON PRENOTAZIONE [POMERIGGIO]"
+                               : "CHECK-IN CON PRENOTAZIONE [SERA]"), ora_attuale);
+                    return;
+                }
+            }
+        }
+    }
+
+    /* 3. Ricerca in coda per la fascia corrente.
+     *    Caso particolare: lo studente aveva prenotato in anticipo per la
+     *    fascia che ora e' diventata corrente, ma non e' stato ancora
+     *    promosso ad un posto fisico (es. promosso da cambio_fascia ma
+     *    aula piena, o ancora in coda perche' i posti erano gia' tutti
+     *    presi). Lo estraiamo e gli diamo un posto come da prenotazione. */
+    {
+        NodoAttesa* curr = coda->head;
+        NodoAttesa* prev = NULL;
+        while (curr != NULL) {
+            if (strcmp(curr->matricola, matricola) == 0 && curr->fascia == aula->fascia) {
+                /* Scollegamento del nodo: gestiamo i tre casi (testa, mezzo, coda). */
+                if (prev == NULL) coda->head = curr->next;
+                else              prev->next  = curr->next;
+                if (coda->tail == curr) coda->tail = prev;
+                coda->dimensione--;
+                free(curr);
+
+                /* Assegnazione first-fit del primo posto LIBERO. */
+                {
+                    int i;
+                    for (i = 0; i < MAX_POSTI; i++) {
+                        if (aula->posti[i].stato == LIBERO) {
+                            aula->posti[i].stato = OCCUPATO;
+                            strncpy(aula->posti[i].matricola_studente, matricola, 11);
+                            aula->posti[i].matricola_studente[11] = '\0';
+                            aula->posti[i].ora_prenotazione = ora_attuale;
+                            aula->posti_occupati++;
+                            aula->totale_checkin++;
+                            aula->accessi_per_fascia[(int)aula->fascia]++;
+                            printf("[CHECK-IN] Prenotazione anticipata confermata. Benvenuto al posto %d!\n", i + 1);
+                            salva_storico_accesso(anagrafica, matricola,
+                                       (aula->fascia == MATTINA ? "CHECK-IN DA PRENOTAZIONE ANTICIPATA [MATTINA]"
+                                       : aula->fascia == POMERIGGIO ? "CHECK-IN DA PRENOTAZIONE ANTICIPATA [POMERIGGIO]"
+                                       : "CHECK-IN DA PRENOTAZIONE ANTICIPATA [SERA]"), ora_attuale);
+                            return;
+                        }
+                    }
+                    /* Estratto dalla coda ma nessun posto libero: rimettiamo
+                     * in coda per non perdere lo studente. */
+                    accoda_studente(coda, matricola, aula->data, aula->fascia);
+                    printf("[AULA PIENA] Prenotazione anticipata trovata ma nessun posto libero. Rimesso in coda.\n");
+                    return;
+                }
+            }
+            prev = curr;
+            curr = curr->next;
+        }
+    }
+
+    /* 4. Controllo coda con fascia futura: lo studente ha una prenotazione
+     *    anticipata che non e' ancora "maturata". Non puo' entrare ora. */
+    {
+        NodoAttesa* curr = coda->head;
+        while (curr != NULL) {
+            if (strcmp(curr->matricola, matricola) == 0 && curr->fascia > aula->fascia) {
+                printf("[ATTESA] Hai una prenotazione per la fascia %s, ma siamo ancora in fascia %s.\n"
+                       "         Attendi il cambio turno automatico per effettuare il check-in.\n",
+                       (curr->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"),
+                       (aula->fascia == MATTINA ? "MATTINA" : "POMERIGGIO"));
+                return;
+            }
+            curr = curr->next;
+        }
+    }
+
+    /* 5. Ingresso senza prenotazione.
+     *    Concesso solo se: c'e' almeno un posto LIBERO E la coda e' vuota.
+     *    Il secondo vincolo e' una scelta di equita': se qualcuno gia'
+     *    aspetta in coda, non e' giusto che un nuovo arrivato gli "salti"
+     *    davanti. Si conta posti_liberi direttamente invece di usare
+     *    (MAX_POSTI - posti_occupati) perche' posti_occupati include
+     *    anche i PRENOTATI non ancora arrivati. */
+    {
+        int posti_liberi = 0;
+        int i;
+        for (i = 0; i < MAX_POSTI; i++)
+            if (aula->posti[i].stato == LIBERO) posti_liberi++;
+
+        if (posti_liberi > 0 && coda->dimensione == 0) {
+            for (i = 0; i < MAX_POSTI; i++) {
+                if (aula->posti[i].stato == LIBERO) {
+                    aula->posti[i].stato = OCCUPATO;
+                    strncpy(aula->posti[i].matricola_studente, matricola, 11);
+                    aula->posti[i].matricola_studente[11] = '\0';
+                    aula->posti_occupati++;
+                    aula->totale_checkin++;
+                    aula->accessi_per_fascia[(int)aula->fascia]++;
+
+                    printf("[SUCCESSO] Nessuna prenotazione. Posto libero %d assegnato direttamente.\n", i + 1);
+                    salva_storico_accesso(anagrafica, matricola,
+                                    (aula->fascia == MATTINA ? "CHECK-IN SENZA PRENOTAZIONE [MATTINA]"
+                                    : aula->fascia == POMERIGGIO ? "CHECK-IN SENZA PRENOTAZIONE [POMERIGGIO]"
+                                    : "CHECK-IN SENZA PRENOTAZIONE [SERA]"), ora_attuale);
+                    return;
+                }
+            }
+        } else {
+            /* 6. Inserimento in lista d'attesa: aula piena oppure c'e' gia'
+             *    qualcuno in coda con priorita' maggiore. */
+            if (coda->dimensione > 0 && aula->posti_occupati < MAX_POSTI) {
+                printf("[INFO] Ci sono persone in attesa prima di te. Ti aggiungo alla coda.\n");
+            } else {
+                printf("[AULA PIENA] Nessun posto disponibile.\n");
+            }
+
+            printf("Inserimento nella lista d'attesa per la fascia %s.\n",
+                    (aula->fascia == MATTINA ? "MATTINA" : (aula->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA")));
+
+            accoda_studente(coda, matricola, aula->data, aula->fascia);
+            salva_storico_accesso(anagrafica, matricola,
+                    (aula->fascia == MATTINA ? "INSERIMENTO IN LISTA ATTESA [MATTINA]"
+                    : aula->fascia == POMERIGGIO ? "INSERIMENTO IN LISTA ATTESA [POMERIGGIO]"
+                    : "INSERIMENTO IN LISTA ATTESA [SERA]"), ora_attuale);
+        }
+    }
+}
+
+/*
+ * estrai_studente:
+ *   Estrae (dequeue) il primo nodo della coda d'attesa, restituendo
+ *   un puntatore al nodo scollegato dalla lista.
+ *
+ *   Il chiamante e' responsabile della free() del nodo restituito:
+ *   questa funzione si limita a scollegarlo, lasciando al caller il
+ *   compito di leggerne i campi prima di rilasciare la memoria.
+ *
+ * Parametri:
+ *   coda: puo' essere NULL (caso difensivo).
+ *
+ * Ritorna:
+ *   Puntatore al nodo estratto, oppure NULL se la coda e' vuota/NULL.
+ *
+ * Pre:  -
+ * Post: dimensione coda decrementata di 1 (se c'era qualcosa); head e tail
+ *       aggiornati in modo coerente; il nodo restituito ha next == NULL.
+ */
+NodoAttesa* estrai_studente(CodaAttesa* coda) {
+    if (coda == NULL || coda->head == NULL) {
+        return NULL;
+    }
+
+    NodoAttesa* estratto = coda->head;
+    coda->head = estratto->next;
+
+    /* Se la coda e' diventata vuota anche tail va azzerato, altrimenti
+     * resterebbe come dangling pointer al nodo appena estratto. */
+    if (coda->head == NULL) {
+        coda->tail = NULL;
+    }
+
+    /* Sgancio fisico: il nodo restituito non deve piu' essere collegato
+     * alla catena, cosi' il caller puo' liberarlo in sicurezza. */
+    estratto->next = NULL;
+
+    /* Difesa contro inconsistenze (non dovrebbe mai succedere se la coda
+     * e' stata sempre manipolata tramite le funzioni dedicate). */
+    if (coda->dimensione > 0) {
+        coda->dimensione--;
+    }
+
+    return estratto;
+}
