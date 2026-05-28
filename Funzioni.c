@@ -212,3 +212,80 @@ void inserisci_studente(TabellaHashStudenti* t, Studente s) {
 
     printf("[REGISTRAZIONE] Studente %s inserito con successo.\n", s.matricola);
 }
+
+/*
+ * crea_studente:
+ *   Costruisce un oggetto Studente popolando i suoi campi.
+ *   Funzione di servizio per uso interno al modulo: serve a centralizzare
+ *   la copia sicura delle stringhe (strncpy + terminazione esplicita).
+ *
+ * Parametri:
+ *   matricola, nome, corso: stringhe valide (non NULL).
+ *
+ * Pre:  i tre parametri stringa sono non NULL e terminati.
+ * Post: ritorna uno Studente con i campi copiati e sicuramente terminati
+ *       da '\0' anche se le stringhe sorgenti eccedevano la capienza.
+ */
+Studente crea_studente(char* matricola, char* nome, char* corso) {
+    Studente s;
+    /* Limitiamo la copia a (dimensione_campo - 1) e forziamo il '\0' finale:
+     * strncpy da sola NON garantisce la terminazione se la sorgente e'
+     * piu' lunga del limite. */
+    strncpy(s.matricola, matricola, 11); s.matricola[11] = '\0';
+    strncpy(s.nome, nome, 59);           s.nome[59]       = '\0';
+    strncpy(s.corso_di_laurea, corso, 59); s.corso_di_laurea[59] = '\0';
+    return s;
+}
+
+/*
+ * get_nome_studente:
+ *   Getter del campo nome di uno Studente. Necessario perche' Studente
+ *   e' un tipo opaco: il main non puo' accedere a s->nome direttamente.
+ *
+ * Parametri:
+ *   s: puntatore a Studente; puo' essere NULL.
+ *
+ * Ritorna:
+ *   Puntatore a stringa (sola lettura, vita legata al nodo nella hash).
+ *   Stringa vuota se s e' NULL: cosi' il caller puo' fare printf senza
+ *   controlli aggiuntivi e senza rischio di dereferenziare un NULL.
+ */
+const char* get_nome_studente(Studente* s) {
+    if (s == NULL) return "";
+    return s->nome;
+}
+
+/*
+ * registra_studente:
+ *   API pubblica per registrare uno studente partendo dai tre campi
+ *   stringa. E' l'unico modo che ha il main di inserire studenti, dato
+ *   che Studente e' opaco: il main non puo' dichiarare variabili Studente
+ *   ne' accedere ai suoi campi direttamente.
+ *
+ *   Rispetto a inserisci_studente, in piu':
+ *     - costruisce internamente lo Studente con crea_studente;
+ *     - registra l'evento "REGISTRAZIONE" nello storico, ma solo se
+ *       lo studente e' stato effettivamente inserito (non per i duplicati).
+ *
+ * Parametri:
+ *   t, matricola, nome, corso: tutti non NULL.
+ *
+ * Pre:  t inizializzata.
+ * Post: studente inserito (se nuovo) e storico aggiornato di conseguenza.
+ */
+void registra_studente(TabellaHashStudenti* t, char* matricola, char* nome, char* corso) {
+    /* Salviamo lo stato "prima" per distinguere nuova registrazione da duplicato:
+     * inserisci_studente non ritorna un esito, quindi controlliamo noi. */
+    int era_presente = (cerca_studente(t, matricola) != NULL);
+    inserisci_studente(t, crea_studente(matricola, nome, corso));
+
+    /* Logghiamo solo se l'inserimento e' effettivamente avvenuto. La seconda
+     * verifica con cerca_studente copre anche il caso in cui la malloc sia
+     * fallita: in quel caso non vogliamo scrivere una falsa registrazione. */
+    if (!era_presente && cerca_studente(t, matricola) != NULL) {
+        /* Ora 00:00:00 perche' la registrazione e' un evento amministrativo
+         * non legato all'orario virtuale del turno. */
+        OrarioVirtuale ora_zero = {0, 0, 0};
+        salva_storico_accesso(t, matricola, "REGISTRAZIONE", ora_zero);
+    }
+}
