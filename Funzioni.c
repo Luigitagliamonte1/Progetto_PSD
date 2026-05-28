@@ -703,3 +703,263 @@ NodoAttesa* estrai_studente(CodaAttesa* coda) {
 
     return estratto;
 }
+
+/*
+ * effettua_checkout:
+ *   Gestisce l'uscita di uno studente dall'aula. Quando un posto si libera,
+ *   si tenta automaticamente di farci subentrare il primo studente in coda
+ *   con fascia uguale a quella corrente.
+ *
+ *   Nota sulla scelta del subentrante: si scorre tutta la coda invece di
+ *   prendere semplicemente la testa, perche' la coda puo' contenere anche
+ *   nodi con fascia futura (prenotazioni anticipate) che non vogliamo
+ *   promuovere ora. Si prende il PRIMO compatibile in ordine FIFO.
+ *
+ *   Il subentrante riceve stato PRENOTATO (non OCCUPATO): deve comunque
+ *   passare per un check-in esplicito per "sedersi". Questo permette di
+ *   tenere distinte le prenotazioni dai presenti effettivi nelle statistiche.
+ *
+ * Parametri:
+ *   anagrafica, aula, coda, matricola: non NULL.
+ *   ora_attuale: timestamp virtuale per lo storico.
+ *
+ * Pre:  sistema inizializzato.
+ * Post: il posto torna LIBERO oppure passa al subentrante; nei due casi
+ *       lo storico riporta CHECK-OUT e (se applicabile) SUBENTRO.
+ */
+void effettua_checkout(TabellaHashStudenti* anagrafica, TurnoAula* aula, CodaAttesa* coda, char* matricola, OrarioVirtuale ora_attuale) {
+    if (aula == NULL || coda == NULL || matricola == NULL) return;
+
+    int trovato = 0;
+    int i;
+
+    for (i = 0; i < MAX_POSTI; i++) {
+        if (aula->posti[i].stato != LIBERO && strcmp(aula->posti[i].matricola_studente, matricola) == 0) {
+
+            printf("\n[CHECK-OUT] Studente %s uscito dal posto %d.\n", matricola, i + 1);
+            salva_storico_accesso(anagrafica, matricola, "CHECK-OUT (USCITA)", ora_attuale);
+            aula->totale_checkout++;
+            trovato = 1;
+
+            /* Ricerca subentrante: primo nodo in coda con fascia corrente.
+             * Manteniamo prev per poter scollegare il nodo trovato. */
+            {
+                NodoAttesa* curr = coda->head;
+                NodoAttesa* prev = NULL;
+                NodoAttesa* subentrante = NULL;
+
+                while (curr != NULL) {
+                    if (curr->fascia == aula->fascia) {
+                        subentrante = curr;
+                        /* Scollegamento dalla coda con i 3 casi:
+                         * testa, in mezzo, coda. */
+                        if (prev == NULL)
+                            coda->head = curr->next;
+                        else
+                            prev->next = curr->next;
+                        if (coda->tail == curr)
+                            coda->tail = prev;
+                        coda->dimensione--;
+                        break;
+                    }
+                    prev = curr;
+                    curr = curr->next;
+                }
+
+                if (subentrante != NULL) {
+                    /* Il posto resta "occupato" nel contatore: cambia solo
+                     * l'inquilino. Quindi posti_occupati NON va modificato. */
+                    strncpy(aula->posti[i].matricola_studente, subentrante->matricola, 11);
+                    aula->posti[i].matricola_studente[11] = '\0';
+                    aula->posti[i].stato = PRENOTATO;
+                    aula->posti[i].ora_prenotazione = ora_attuale;
+
+                    printf("[SUBENTRO] Posto %d riservato per %s (fascia %s).\n",
+                           i + 1, subentrante->matricola,
+                           (aula->fascia == MATTINA ? "MATTINA" : aula->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+                    salva_storico_accesso(anagrafica, subentrante->matricola, "SUBENTRO DALLA CODA (PRENOTATO)", ora_attuale);
+                    free(subentrante);
+                } else {
+                    /* Nessun subentrante compatibile: il posto torna LIBERO
+                     * e va decrementato posti_occupati. */
+                    aula->posti[i].stato = LIBERO;
+                    strcpy(aula->posti[i].matricola_studente, "");
+                    if (aula->posti_occupati > 0) aula->posti_occupati--;
+
+                    if (coda->dimensione > 0)
+                        printf("[INFO] Posto %d libero. In coda ci sono %d studenti di altri turni.\n",
+                               i + 1, coda->dimensione);
+                    else
+                        printf("[INFO] Posto %d ora libero. Nessuno in lista d'attesa.\n", i + 1);
+                }
+            }
+            break;
+        }
+    }
+
+    if (!trovato)
+        printf("\n[ERRORE] La matricola %s non risulta presente in aula.\n", matricola);
+}
+
+/* ==========================================================================
+ * INIZIALIZZAZIONE E REPORTING
+ * ========================================================================== */
+
+/*
+ * inizializza_sistema:
+ *   Inizializza tabella hash, coda e turno aula partendo da strutture
+ *   gia' allocate (stack o heap). Per allocazione+inizializzazione in
+ *   un colpo solo vedi inizializza_sistema_dinamico.
+ *
+ *   Imposta la data del turno alla data reale di sistema (formato
+ *   GG/MM/AAAA) e la fascia di default a MATTINA. La fascia verra'
+ *   poi aggiornata automaticamente da aggiorna_orario_automatico in
+ *   base all'orario virtuale.
+ *
+ * Parametri:
+ *   t, aula, coda: non NULL; possono contenere "spazzatura" (verra'
+ *   sovrascritta).
+ *
+ * Pre:  le tre strutture sono allocate.
+ * Post: tutti i bucket NULL, coda vuota, tutti i posti LIBERO,
+ *       contatori a zero, data e fascia di default impostate.
+ */
+void inizializza_sistema(TabellaHashStudenti* t, TurnoAula* aula, CodaAttesa* coda) {
+    if (t == NULL || aula == NULL || coda == NULL) {
+        fprintf(stderr, "[ERRORE] Puntatori non validi in inizializzazione!\n");
+        return;
+    }
+
+    /* Tabella hash: ogni bucket parte vuoto. */
+    {
+        int i;
+        for (i = 0; i < BUCKETS; i++) t->tabella[i] = NULL;
+    }
+
+    /* Coda: head/tail NULL, dimensione zero. */
+    coda->head = NULL;
+    coda->tail = NULL;
+    coda->dimensione = 0;
+
+    /* Aula: contatori azzerati. */
+    aula->posti_occupati         = 0;
+    aula->totale_prenotazioni    = 0;
+    aula->totale_checkin         = 0;
+    aula->totale_checkout        = 0;
+    aula->totale_no_show         = 0;
+    aula->totale_espulsi_da_coda = 0;
+    aula->accessi_per_fascia[0]  = 0; /* MATTINA    */
+    aula->accessi_per_fascia[1]  = 0; /* POMERIGGIO */
+    aula->accessi_per_fascia[2]  = 0; /* SERA       */
+
+    /* Data: usiamo la data reale del sistema (time/localtime/strftime).
+     * Lo shadowing della variabile 't' nel blocco interno e' voluto e
+     * non causa problemi perche' la 't' esterna non serve qui. */
+    {
+        time_t t = time(NULL);
+        struct tm* tm_info = localtime(&t);
+        strftime(aula->data, 11, "%d/%m/%Y", tm_info);
+    }
+    aula->fascia = MATTINA;
+
+    /* Posti: numerati 1..MAX_POSTI, tutti LIBERO con matricola vuota. */
+    {
+        int i;
+        for (i = 0; i < MAX_POSTI; i++) {
+            aula->posti[i].numero_posto = i + 1;
+            aula->posti[i].stato = LIBERO;
+            memset(aula->posti[i].matricola_studente, 0, 12);
+        }
+    }
+
+    printf("[SISTEMA] Aula Studio pronta. Data: %s | Fascia: MATTINA\n\n", aula->data);
+}
+
+/*
+ * genera_report_aula:
+ *   Stampa il report completo richiesto dalla traccia:
+ *     - totale prenotazioni, accessi effettivi, no-show, espulsi;
+ *     - snapshot istantaneo (presenti, prenotati, posti liberi, coda);
+ *     - occupazione cumulativa per fascia oraria;
+ *     - barra di saturazione visuale (=, #, ! per intensita' crescente);
+ *     - storico completo letto da file.
+ *
+ *   La funzione e' di sola lettura: non modifica ne' aula ne' coda.
+ *
+ * Parametri:
+ *   aula, coda: non NULL.
+ *
+ * Pre:  sistema inizializzato.
+ * Post: nessuna modifica alle strutture; output su stdout.
+ */
+void genera_report_aula(TurnoAula* aula, CodaAttesa* coda) {
+    if (aula == NULL || coda == NULL) return;
+
+    /* Snapshot istantaneo: conta lo stato corrente dei posti.
+     * Non usiamo posti_occupati perche' vogliamo distinguere
+     * tra OCCUPATO (presente) e PRENOTATO (atteso). */
+    int presenti_ora    = 0;
+    int prenotati_ora   = 0;
+
+    int i;
+    for (i = 0; i < MAX_POSTI; i++) {
+        if      (aula->posti[i].stato == OCCUPATO)  presenti_ora++;
+        else if (aula->posti[i].stato == PRENOTATO) prenotati_ora++;
+    }
+
+    /* Percentuale di saturazione: presenti+prenotati sul totale posti.
+     * Cast a float per evitare divisione intera. La guardia MAX_POSTI > 0
+     * evita divisione per zero in configurazioni pazze. */
+    float perc = (MAX_POSTI > 0) ? ((float)(presenti_ora + prenotati_ora) / MAX_POSTI) * 100.0f : 0.0f;
+
+    printf("\n+==========================================+\n");
+    printf("|        REPORT DETTAGLIATO AULA          |\n");
+    printf("+==========================================+\n");
+    printf("  Data   : %-10s\n", aula->data);
+    printf("  Fascia : %s\n",
+           (aula->fascia == MATTINA ? "MATTINA (09:00-13:00)"
+          : aula->fascia == POMERIGGIO ? "POMERIGGIO (14:00-18:00)"
+          : "SERA (18:00-22:00)"));
+
+    printf("\n--- RIEPILOGO TURNO CORRENTE --------------\n");
+    printf("  Totale prenotazioni effettuate : %d\n", aula->totale_prenotazioni);
+    printf("  Accessi effettivi (check-in)   : %d\n", aula->totale_checkin);
+    printf("  Uscite registrate (check-out)  : %d\n", aula->totale_checkout);
+    printf("  No-show (prenotati non arrivati): %d\n", aula->totale_no_show);
+    printf("  Rimasti in attesa (espulsi)    : %d\n", aula->totale_espulsi_da_coda);
+
+    printf("\n--- SNAPSHOT ISTANTANEO -------------------\n");
+    printf("  Presenti in aula ora           : %d\n", presenti_ora);
+    printf("  Prenotati non ancora arrivati  : %d\n", prenotati_ora);
+    printf("  Posti liberi                   : %d / %d\n", MAX_POSTI - presenti_ora - prenotati_ora, MAX_POSTI);
+    printf("  In lista d'attesa ora          : %d\n", coda->dimensione);
+
+    printf("\n--- OCCUPAZIONE PER FASCIA ----------------\n");
+    printf("  MATTINA    : %d accessi\n", aula->accessi_per_fascia[0]);
+    printf("  POMERIGGIO : %d accessi\n", aula->accessi_per_fascia[1]);
+    printf("  SERA       : %d accessi\n", aula->accessi_per_fascia[2]);
+
+    /* Barra di saturazione: scegliamo il carattere in base alla soglia
+     * (>=80% critica, >=50% alta, altrimenti normale). I caratteri sono
+     * raddoppiati nella legenda perche' lo sguardo li riconosce meglio. */
+    printf("\n--- SATURAZIONE AULA ----------------------\n");
+    printf("  %.1f%% occupata  [", perc);
+    {
+        int bar_width = 30;
+        int pos = (int)((perc / 100.0f) * bar_width);
+        int j;
+        for (j = 0; j < bar_width; j++) {
+            if      (j < pos && perc >= 80) printf("!");
+            else if (j < pos && perc >= 50) printf("#");
+            else if (j < pos)               printf("=");
+            else                            printf("-");
+        }
+    }
+    printf("]\n");
+    printf("  Legenda: == normale  ## alta  !! critica\n");
+
+    printf("\n===========================================\n");
+
+    /* Storico accessi: completiamo il report con il log persistente. */
+    visualizza_storico_accessi();
+}
