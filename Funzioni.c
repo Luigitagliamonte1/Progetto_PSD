@@ -963,3 +963,392 @@ void genera_report_aula(TurnoAula* aula, CodaAttesa* coda) {
     /* Storico accessi: completiamo il report con il log persistente. */
     visualizza_storico_accessi();
 }
+/*
+ * esegui_test_completo:
+ *   Esegue una batteria di test automatici che copre tutti i casi d'uso
+ *   richiesti dalla traccia. Ogni test stampa [PASS] o [FAIL] a seconda
+ *   del risultato.
+ *
+ *   I test sono volutamente in sequenza nella stessa funzione (e non
+ *   in funzioni separate) per condividere le strutture e per produrre
+ *   un output di console ordinato leggibile dall'esaminatore.
+ *
+ *   Tra un test e l'altro c'e' un "reset parziale" delle strutture:
+ *   non si reinizializza l'anagrafica (gli studenti restano), ma si
+ *   azzerano posti, contatori e coda per partire da uno stato pulito.
+ *
+ * Parametri:
+ *   anagrafica, aula, coda: gia' inizializzati.
+ *
+ * Pre:  inizializza_sistema(_dinamico) gia' chiamato.
+ * Post: le strutture sono state ampiamente modificate dai test; il file
+ *       storico_accessi.txt e' stato popolato.
+ */
+void esegui_test_completo(TabellaHashStudenti* anagrafica, TurnoAula* aula, CodaAttesa* coda) {
+
+    OrarioVirtuale ora_test = {10, 0, 0}; /* Orario fittizio dentro la fascia MATTINA */
+    int i;
+
+    printf("\n==========================================\n");
+    printf("       AVVIO TEST AUTOMATICO COMPLETO     \n");
+    printf("==========================================\n");
+
+    /* ------------------------------------------------------------------
+     * TEST 1: Registrazione studenti
+     * Verifica che 3 studenti vengano inseriti e ritrovati, e che un
+     * tentativo di duplicato venga rifiutato senza sovrascrivere i dati.
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 1] Registrazione studenti\n");
+    printf("------------------------------------------\n");
+
+    registra_studente(anagrafica, "T001", "Mario Rossi",   "Informatica");
+    registra_studente(anagrafica, "T002", "Elena Bianchi", "Matematica");
+    registra_studente(anagrafica, "T003", "Luca Verdi",    "Fisica");
+
+    if (cerca_studente(anagrafica, "T001") != NULL)
+        printf("  [PASS] T001 registrato e trovato\n");
+    else
+        printf("  [FAIL] T001 non trovato\n");
+
+    if (cerca_studente(anagrafica, "T002") != NULL)
+        printf("  [PASS] T002 registrato e trovato\n");
+    else
+        printf("  [FAIL] T002 non trovato\n");
+
+    if (cerca_studente(anagrafica, "T003") != NULL)
+        printf("  [PASS] T003 registrato e trovato\n");
+    else
+        printf("  [FAIL] T003 non trovato\n");
+
+    /* Tentativo duplicato: dopo l'operazione T001 deve ancora chiamarsi
+     * "Mario Rossi" e NON "Duplicato" - questo prova che il duplicato
+     * e' stato rifiutato senza sovrascrivere. */
+    registra_studente(anagrafica, "T001", "Duplicato", "Duplicato");
+    {
+        Studente* dup = cerca_studente(anagrafica, "T001");
+        if (dup != NULL && strcmp(dup->nome, "Mario Rossi") == 0)
+            printf("  [PASS] Duplicato rifiutato (nome originale preservato)\n");
+        else
+            printf("  [FAIL] Duplicato accettato (nome sovrascritto)\n");
+    }
+
+    /* ------------------------------------------------------------------
+     * TEST 2: Prenotazioni
+     * Verifica casi: prenotazione valida, matricola inesistente,
+     * prenotazione duplicata.
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 2] Prenotazioni\n");
+    printf("------------------------------------------\n");
+
+    effettua_prenotazione(anagrafica, aula, coda, "T001", MATTINA, ora_test);
+    if (aula->totale_prenotazioni == 1)
+        printf("  [PASS] Prenotazione T001 registrata\n");
+    else
+        printf("  [FAIL] Prenotazione T001 non registrata\n");
+
+    /* Matricola inesistente: il contatore prenotazioni NON deve aumentare. */
+    effettua_prenotazione(anagrafica, aula, coda, "XXXX", MATTINA, ora_test);
+    if (aula->totale_prenotazioni == 1)
+        printf("  [PASS] Matricola inesistente rifiutata\n");
+    else
+        printf("  [FAIL] Matricola inesistente accettata (errore)\n");
+
+    /* Duplicato: stessa matricola, stessa fascia. Anche qui il contatore
+     * non deve aumentare. */
+    effettua_prenotazione(anagrafica, aula, coda, "T001", MATTINA, ora_test);
+    if (aula->totale_prenotazioni == 1)
+        printf("  [PASS] Prenotazione duplicata rifiutata\n");
+    else
+        printf("  [FAIL] Prenotazione duplicata accettata (errore)\n");
+
+    /* Reset parziale tra i test: anagrafica preservata, stato dinamico azzerato. */
+    for (i = 0; i < MAX_POSTI; i++) {
+        aula->posti[i].stato = LIBERO;
+        strcpy(aula->posti[i].matricola_studente, "");
+    }
+    aula->posti_occupati      = 0;
+    aula->totale_prenotazioni = 0;
+    aula->totale_checkin      = 0;
+    aula->totale_checkout     = 0;
+    svuota_coda(coda);
+
+    /* ------------------------------------------------------------------
+     * TEST 3: Disponibilita' posti
+     * Verifica che il numero di posti LIBERO diminuisca dopo una
+     * prenotazione e venga ripristinato dopo un annullamento.
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 3] Disponibilita' posti\n");
+    printf("------------------------------------------\n");
+
+    {
+        int liberi_prima = 0, liberi_dopo = 0;
+
+        for (i = 0; i < MAX_POSTI; i++)
+            if (aula->posti[i].stato == LIBERO) liberi_prima++;
+
+        effettua_prenotazione(anagrafica, aula, coda, "T001", MATTINA, ora_test);
+
+        for (i = 0; i < MAX_POSTI; i++)
+            if (aula->posti[i].stato == LIBERO) liberi_dopo++;
+
+        if (liberi_dopo == liberi_prima - 1)
+            printf("  [PASS] Posti liberi diminuiti di 1 dopo prenotazione\n");
+        else
+            printf("  [FAIL] Contatore posti liberi errato (prima=%d dopo=%d)\n",
+                   liberi_prima, liberi_dopo);
+
+        annulla_prenotazione(anagrafica, aula, coda, "T001", ora_test);
+
+        {
+            int liberi_dopo_annullo = 0;
+            for (i = 0; i < MAX_POSTI; i++)
+                if (aula->posti[i].stato == LIBERO) liberi_dopo_annullo++;
+
+            if (liberi_dopo_annullo == liberi_prima)
+                printf("  [PASS] Posti liberi ripristinati dopo annullamento\n");
+            else
+                printf("  [FAIL] Posti liberi non ripristinati (atteso=%d ottenuto=%d)\n",
+                       liberi_prima, liberi_dopo_annullo);
+        }
+    }
+
+    for (i = 0; i < MAX_POSTI; i++) { aula->posti[i].stato = LIBERO; strcpy(aula->posti[i].matricola_studente, ""); }
+    aula->posti_occupati = 0;
+    aula->totale_prenotazioni = 0;
+    aula->totale_checkin = 0;
+    aula->totale_checkout = 0;
+    svuota_coda(coda);
+
+    /* ------------------------------------------------------------------
+     * TEST 4: Check-in e check-out
+     * Verifica la transizione PRENOTATO -> OCCUPATO -> LIBERO e il
+     * corretto incremento dei contatori statistici.
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 4] Check-in e check-out\n");
+    printf("------------------------------------------\n");
+
+    effettua_prenotazione(anagrafica, aula, coda, "T001", MATTINA, ora_test);
+    effettua_checkin(anagrafica, aula, coda, "T001", ora_test);
+
+    {
+        int trovato = 0;
+        for (i = 0; i < MAX_POSTI; i++) {
+            if (strcmp(aula->posti[i].matricola_studente, "T001") == 0) {
+                trovato = 1;
+                if (aula->posti[i].stato == OCCUPATO)
+                    printf("  [PASS] Check-in: posto T001 e' OCCUPATO\n");
+                else
+                    printf("  [FAIL] Check-in: posto T001 non e' OCCUPATO\n");
+                break;
+            }
+        }
+        if (!trovato) printf("  [FAIL] Check-in: T001 non trovato in nessun posto\n");
+    }
+
+    if (aula->totale_checkin == 1)
+        printf("  [PASS] totale_checkin == 1\n");
+    else
+        printf("  [FAIL] totale_checkin != 1 (ottenuto: %d)\n", aula->totale_checkin);
+
+    effettua_checkout(anagrafica, aula, coda, "T001", ora_test);
+
+    /* Dopo il checkout T001 non deve risultare seduto da nessuna parte. */
+    {
+        int ancora_occupato = 0;
+        for (i = 0; i < MAX_POSTI; i++)
+            if (strcmp(aula->posti[i].matricola_studente, "T001") == 0 && aula->posti[i].stato != LIBERO)
+                ancora_occupato = 1;
+
+        if (!ancora_occupato)
+            printf("  [PASS] Check-out: posto T001 liberato correttamente\n");
+        else
+            printf("  [FAIL] Check-out: posto T001 ancora occupato\n");
+    }
+
+    if (aula->totale_checkout == 1)
+        printf("  [PASS] totale_checkout == 1\n");
+    else
+        printf("  [FAIL] totale_checkout != 1 (ottenuto: %d)\n", aula->totale_checkout);
+
+    for (i = 0; i < MAX_POSTI; i++) { aula->posti[i].stato = LIBERO; strcpy(aula->posti[i].matricola_studente, ""); }
+    aula->posti_occupati = 0;
+    aula->totale_prenotazioni = 0;
+    aula->totale_checkin = 0;
+    aula->totale_checkout = 0;
+    svuota_coda(coda);
+
+    /* ------------------------------------------------------------------
+     * TEST 5: Ingresso senza prenotazione
+     * Caso A: coda vuota e posti liberi -> ingresso diretto.
+     * Caso B: c'e' gia' qualcuno in coda -> il nuovo arrivato va in coda
+     *         (priorita' FIFO, non si "salta la fila").
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 5] Ingresso senza prenotazione\n");
+    printf("------------------------------------------\n");
+
+    effettua_checkin(anagrafica, aula, coda, "T002", ora_test);
+    if (aula->totale_checkin == 1)
+        printf("  [PASS] Ingresso diretto senza prenotazione (coda vuota)\n");
+    else
+        printf("  [FAIL] Ingresso diretto fallito\n");
+
+    /* Forziamo una presenza in coda per simulare il Caso B. */
+    accoda_studente(coda, "DUMMY", aula->data, MATTINA);
+    effettua_checkin(anagrafica, aula, coda, "T003", ora_test);
+
+    {
+        int t003_in_aula = 0;
+        for (i = 0; i < MAX_POSTI; i++)
+            if (strcmp(aula->posti[i].matricola_studente, "T003") == 0) t003_in_aula = 1;
+
+        if (!t003_in_aula && coda->dimensione >= 1)
+            printf("  [PASS] Ingresso con coda non vuota: T003 messo in attesa\n");
+        else
+            printf("  [FAIL] T003 entrato nonostante coda non vuota\n");
+    }
+
+    for (i = 0; i < MAX_POSTI; i++) { aula->posti[i].stato = LIBERO; strcpy(aula->posti[i].matricola_studente, ""); }
+    aula->posti_occupati = 0;
+    aula->totale_prenotazioni = 0;
+    aula->totale_checkin = 0;
+    aula->totale_checkout = 0;
+    svuota_coda(coda);
+
+    /* ------------------------------------------------------------------
+     * TEST 6: Lista di attesa e subentro automatico
+     * Aula piena -> check-in va in coda.
+     * Successivo check-out -> primo della coda subentra come PRENOTATO.
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 6] Lista di attesa e subentro\n");
+    printf("------------------------------------------\n");
+
+    /* Riempiamo artificialmente tutti i posti con la matricola fittizia FILL. */
+    for (i = 0; i < MAX_POSTI; i++) {
+        aula->posti[i].stato = OCCUPATO;
+        strncpy(aula->posti[i].matricola_studente, "FILL", 11);
+    }
+    aula->posti_occupati = MAX_POSTI;
+
+    effettua_checkin(anagrafica, aula, coda, "T001", ora_test);
+    if (coda->dimensione == 1)
+        printf("  [PASS] Aula piena: T001 inserito in coda\n");
+    else
+        printf("  [FAIL] T001 non in coda (dimensione: %d)\n", coda->dimensione);
+
+    /* Liberando un posto, T001 deve subentrare automaticamente. */
+    effettua_checkout(anagrafica, aula, coda, "FILL", ora_test);
+
+    if (coda->dimensione == 0)
+        printf("  [PASS] Coda svuotata dopo subentro\n");
+    else
+        printf("  [FAIL] Coda non svuotata dopo subentro (dimensione: %d)\n", coda->dimensione);
+
+    {
+        int subentrato = 0;
+        for (i = 0; i < MAX_POSTI; i++)
+            if (strcmp(aula->posti[i].matricola_studente, "T001") == 0 &&
+                aula->posti[i].stato == PRENOTATO) subentrato = 1;
+
+        if (subentrato)
+            printf("  [PASS] T001 ha subentrato con stato PRENOTATO\n");
+        else
+            printf("  [FAIL] T001 non ha subentrato correttamente\n");
+    }
+
+    for (i = 0; i < MAX_POSTI; i++) { aula->posti[i].stato = LIBERO; strcpy(aula->posti[i].matricola_studente, ""); }
+    aula->posti_occupati = 0;
+    aula->totale_prenotazioni = 0;
+    aula->totale_checkin = 0;
+    aula->totale_checkout = 0;
+    svuota_coda(coda);
+
+    /* ------------------------------------------------------------------
+     * TEST 7: Annullamento prenotazione
+     * Caso A: nessuno in coda  -> posto torna LIBERO.
+     * Caso B: c'e' un subentrante compatibile -> subentra al posto.
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 7] Annullamento prenotazione\n");
+    printf("------------------------------------------\n");
+
+    effettua_prenotazione(anagrafica, aula, coda, "T001", MATTINA, ora_test);
+    annulla_prenotazione(anagrafica, aula, coda, "T001", ora_test);
+
+    {
+        int posto_libero = 1;
+        for (i = 0; i < MAX_POSTI; i++)
+            if (strcmp(aula->posti[i].matricola_studente, "T001") == 0 &&
+                aula->posti[i].stato != LIBERO) posto_libero = 0;
+
+        if (posto_libero)
+            printf("  [PASS] Annullamento senza coda: posto liberato\n");
+        else
+            printf("  [FAIL] Posto non liberato dopo annullamento\n");
+    }
+
+    /* Caso B: prepariamo T001 prenotato e T002 in coda, poi annulliamo T001. */
+    effettua_prenotazione(anagrafica, aula, coda, "T001", MATTINA, ora_test);
+    accoda_studente(coda, "T002", aula->data, MATTINA);
+    annulla_prenotazione(anagrafica, aula, coda, "T001", ora_test);
+
+    {
+        int t002_subentrato = 0;
+        for (i = 0; i < MAX_POSTI; i++)
+            if (strcmp(aula->posti[i].matricola_studente, "T002") == 0 &&
+                aula->posti[i].stato == PRENOTATO) t002_subentrato = 1;
+
+        if (t002_subentrato)
+            printf("  [PASS] Annullamento con coda: T002 ha subentrato\n");
+        else
+            printf("  [FAIL] T002 non ha subentrato dopo annullamento\n");
+
+        if (coda->dimensione == 0)
+            printf("  [PASS] Coda vuota dopo subentro\n");
+        else
+            printf("  [FAIL] Coda non vuota (dimensione: %d)\n", coda->dimensione);
+    }
+
+    for (i = 0; i < MAX_POSTI; i++) { aula->posti[i].stato = LIBERO; strcpy(aula->posti[i].matricola_studente, ""); }
+    aula->posti_occupati = 0;
+    aula->totale_prenotazioni = 0;
+    aula->totale_checkin = 0;
+    aula->totale_checkout = 0;
+    svuota_coda(coda);
+
+    /* ------------------------------------------------------------------
+     * TEST 8: Storico accessi e report
+     * Esegue una sequenza completa (prenotazione + checkin + checkout)
+     * e verifica che i contatori siano coerenti e che il file di storico
+     * esista. Conclude con la stampa del report visivo.
+     * ------------------------------------------------------------------ */
+    printf("\n[TEST 8] Storico accessi e report\n");
+    printf("------------------------------------------\n");
+
+    effettua_prenotazione(anagrafica, aula, coda, "T001", MATTINA, ora_test);
+    effettua_checkin(anagrafica, aula, coda, "T001", ora_test);
+    effettua_checkout(anagrafica, aula, coda, "T001", ora_test);
+
+    if (aula->totale_prenotazioni == 1 && aula->totale_checkin == 1 && aula->totale_checkout == 1)
+        printf("  [PASS] Contatori coerenti (preno=1 checkin=1 checkout=1)\n");
+    else
+        printf("  [FAIL] Contatori errati (preno=%d checkin=%d checkout=%d)\n",
+               aula->totale_prenotazioni, aula->totale_checkin, aula->totale_checkout);
+
+    /* Verifichiamo che il file di log sia stato creato (le funzioni di
+     * salvataggio aprono il file in append, quindi se esiste vuol dire
+     * che almeno una operazione di scrittura e' andata a buon fine). */
+    {
+        FILE* fp = fopen("storico_accessi.txt", "r");
+        if (fp != NULL) {
+            printf("  [PASS] File storico_accessi.txt esiste\n");
+            fclose(fp);
+        } else {
+            printf("  [FAIL] File storico_accessi.txt non trovato\n");
+        }
+    }
+
+    genera_report_aula(aula, coda);
+
+    printf("\n==========================================\n");
+    printf("       TEST COMPLETATI                    \n");
+    printf("==========================================\n");
+}
