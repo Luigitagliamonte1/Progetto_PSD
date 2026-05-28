@@ -289,3 +289,154 @@ void registra_studente(TabellaHashStudenti* t, char* matricola, char* nome, char
         salva_storico_accesso(t, matricola, "REGISTRAZIONE", ora_zero);
     }
 }
+
+/* ==========================================================================
+ * GESTIONE PRENOTAZIONI E ACCESSI
+ * ========================================================================== */
+
+/*
+ * effettua_prenotazione:
+ *   Prenota un posto in aula per uno studente in una specifica fascia oraria.
+ *
+ *   La logica varia in base al rapporto tra fascia richiesta e fascia corrente:
+ *     - fascia_scelta == fascia corrente:
+ *           assegna un posto LIBERO se disponibile, altrimenti accoda.
+ *     - fascia_scelta >  fascia corrente:
+ *           prenotazione anticipata: lo studente va sempre in coda con la
+ *           sua fascia futura. Il posto fisico gli verra' assegnato al
+ *           cambio turno (cambio_fascia_automatica).
+ *     - fascia_scelta <  fascia corrente:
+ *           RIFIUTATA: non si puo' prenotare per un turno gia' concluso.
+ *
+ *   Vengono inoltre prevenuti:
+ *     - prenotazioni di matricole non registrate in anagrafica;
+ *     - doppie prenotazioni sullo stesso turno (sia in posto sia in coda).
+ *
+ * Parametri:
+ *   anagrafica, aula, coda: strutture non NULL.
+ *   matricola: stringa valida.
+ *   fascia_scelta: la fascia per cui si vuole prenotare.
+ *   ora_attuale: timestamp virtuale dell'operazione (per lo storico).
+ *
+ * Pre:  sistema inizializzato; lo studente puo' essere o meno gia' registrato
+ *       (in caso negativo la funzione segnala errore e termina).
+ * Post: posto assegnato OPPURE studente messo in coda OPPURE nessuna modifica
+ *       (in caso di errore o duplicato).
+ */
+void effettua_prenotazione(TabellaHashStudenti* anagrafica, TurnoAula* aula, CodaAttesa* coda, char* matricola, FasciaOraria fascia_scelta, OrarioVirtuale ora_attuale) {
+    int i;
+
+    /* 1. Verifica anagrafica: prenotare e' permesso solo agli studenti
+     *    gia' registrati nel sistema. */
+    if (cerca_studente(anagrafica, matricola) == NULL) {
+        printf("[ERRORE] Matricola %s non registrata. Impossibile prenotare.\n", matricola);
+        return;
+    }
+
+    /* 2. Rifiuto per fascia passata: non ha senso prenotare un turno
+     *    gia' concluso. */
+    if (fascia_scelta < aula->fascia) {
+        printf("[ERRORE] La fascia %s e' gia' conclusa. Puoi prenotare solo per %s o turni successivi.\n",
+               (fascia_scelta == MATTINA ? "MATTINA" : (fascia_scelta == POMERIGGIO ? "POMERIGGIO" : "SERA")),
+               (aula->fascia == MATTINA ? "MATTINA" : (aula->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA")));
+        return;
+    }
+
+    /* 3. Anti-duplicato (posti): lo studente ha gia' un posto assegnato? */
+    for (i = 0; i < MAX_POSTI; i++) {
+        if (aula->posti[i].stato != LIBERO &&
+            strcmp(aula->posti[i].matricola_studente, matricola) == 0) {
+            printf("[AVVISO] Hai gia' una prenotazione al posto %d per il turno corrente.\n", i + 1);
+            return;
+        }
+    }
+
+    /* 4. Anti-duplicato (coda): lo studente e' gia' in attesa
+     *    per la stessa fascia? Controllato in un blocco a parte per
+     *    isolare la dichiarazione di curr. */
+    {
+        NodoAttesa* curr = coda->head;
+        while (curr != NULL) {
+            if (strcmp(curr->matricola, matricola) == 0 && curr->fascia == fascia_scelta) {
+                printf("[AVVISO] Sei gia' in lista d'attesa per la fascia %s.\n",
+                       (fascia_scelta == MATTINA ? "MATTINA" : (fascia_scelta == POMERIGGIO ? "POMERIGGIO" : "SERA")));
+                return;
+            }
+            curr = curr->next;
+        }
+    }
+
+    /* 5. Prenotazione anticipata: si vuole prenotare un turno futuro.
+     *    Va sempre in coda (anche se l'aula corrente fosse vuota), perche'
+     *    i posti del turno futuro non esistono ancora come entita' assegnabile. */
+    if (fascia_scelta > aula->fascia) {
+        printf("[PRENOTAZIONE ANTICIPATA] La fascia %s non e' ancora iniziata.\n"
+               "  Verrai inserito in lista d'attesa e avrai priorita' all'apertura del turno.\n",
+               (fascia_scelta == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+        accoda_studente(coda, matricola, aula->data, fascia_scelta);
+        aula->totale_prenotazioni++;
+        salva_storico_accesso(anagrafica, matricola,
+                       (fascia_scelta == MATTINA ? "PRENOTAZIONE ANTICIPATA [MATTINA]"
+                       : fascia_scelta == POMERIGGIO ? "PRENOTAZIONE ANTICIPATA [POMERIGGIO]"
+                       : "PRENOTAZIONE ANTICIPATA [SERA]"), ora_attuale);
+        return;
+    }
+
+    /* 6. Prenotazione per la fascia corrente: assegna posto se possibile,
+     *    altrimenti accoda. */
+    {
+        int posti_liberi = 0;
+        for (i = 0; i < MAX_POSTI; i++)
+            if (aula->posti[i].stato == LIBERO) posti_liberi++;
+
+        if (posti_liberi > 0) {
+            /* Assegnazione first-fit: si prende il primo posto LIBERO trovato. */
+            for (i = 0; i < MAX_POSTI; i++) {
+                if (aula->posti[i].stato == LIBERO) {
+                    aula->posti[i].stato = PRENOTATO;
+                    strncpy(aula->posti[i].matricola_studente, matricola, 11);
+                    aula->posti[i].matricola_studente[11] = '\0';
+                    aula->posti[i].ora_prenotazione = ora_attuale;
+                    aula->posti_occupati++;
+                    aula->totale_prenotazioni++;
+
+                    printf("[SUCCESSO] Posto %d prenotato alle %02d:%02d:%02d per la fascia %s.\n",
+                           i + 1, ora_attuale.ora, ora_attuale.minuti, ora_attuale.secondi,
+                           (fascia_scelta == MATTINA ? "MATTINA" : (fascia_scelta == POMERIGGIO ? "POMERIGGIO" : "SERA")));
+                    salva_storico_accesso(anagrafica, matricola,
+                       (fascia_scelta == MATTINA ? "PRENOTAZIONE [MATTINA]"
+                       : fascia_scelta == POMERIGGIO ? "PRENOTAZIONE [POMERIGGIO]"
+                       : "PRENOTAZIONE [SERA]"), ora_attuale);
+                    return;
+                }
+            }
+        } else {
+            /* Aula piena: l'unica alternativa accettabile e' la coda. */
+            printf("[AULA PIENA] Tutti i %d posti sono occupati. Ti inserisco in coda...\n", MAX_POSTI);
+            accoda_studente(coda, matricola, aula->data, fascia_scelta);
+            aula->totale_prenotazioni++;
+            salva_storico_accesso(anagrafica, matricola,
+                       (fascia_scelta == MATTINA ? "PRENOTAZIONE IN CODA [MATTINA]"
+                       : fascia_scelta == POMERIGGIO ? "PRENOTAZIONE IN CODA [POMERIGGIO]"
+                       : "PRENOTAZIONE IN CODA [SERA]"), ora_attuale);
+        }
+    }
+}
+
+/*
+ * accoda_studente:
+ *   Aggiunge uno studente in coda alla lista d'attesa (enqueue O(1)).
+ *
+ *   Implementazione tail-insert: grazie al puntatore coda->tail non serve
+ *   scorrere tutta la lista per arrivare in fondo. Il puntatore head viene
+ *   aggiornato solo se la coda era vuota.
+ *
+ * Parametri:
+ *   coda: non NULL.
+ *   matricola, data: stringhe valide (vengono copiate nel nodo).
+ *   fascia: fascia oraria per cui si attende.
+ *
+ * Pre:  coda inizializzata.
+ * Post: dimensione coda incrementata di 1; eventuale allocazione fallita
+ *       segnalata su stderr (la coda resta invariata).
+ */
