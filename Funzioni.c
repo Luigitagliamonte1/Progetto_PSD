@@ -1352,3 +1352,231 @@ void esegui_test_completo(TabellaHashStudenti* anagrafica, TurnoAula* aula, Coda
     printf("       TEST COMPLETATI                    \n");
     printf("==========================================\n");
 }
+
+    /* Verifichiamo che il file di log sia stato creato (le funzioni di
+     * salvataggio aprono il file in append, quindi se esiste vuol dire
+     * che almeno una operazione di scrittura e' andata a buon fine). */
+    {
+        FILE* fp = fopen("storico_accessi.txt", "r");
+        if (fp != NULL) {
+            printf("  [PASS] File storico_accessi.txt esiste\n");
+            fclose(fp);
+        } else {
+            printf("  [FAIL] File storico_accessi.txt non trovato\n");
+        }
+    }
+
+    genera_report_aula(aula, coda);
+
+    printf("\n==========================================\n");
+    printf("       TEST COMPLETATI                    \n");
+    printf("==========================================\n");
+}
+
+/*
+ * annulla_prenotazione:
+ *   Annulla la prenotazione di uno studente. Gestisce due scenari:
+ *
+ *     A) Lo studente ha un posto fisico assegnato (stato PRENOTATO):
+ *        il posto viene liberato; se in coda c'e' un subentrante con
+ *        fascia compatibile, gli viene assegnato il posto.
+ *
+ *     B) Lo studente NON ha un posto fisico ma e' in coda con una
+ *        prenotazione anticipata: il nodo viene rimosso dalla coda
+ *        e il contatore totale_prenotazioni viene decrementato.
+ *
+ *   Se nessuno dei due scenari si applica viene segnalato un errore.
+ *
+ *   Si annulla solo lo stato PRENOTATO, non OCCUPATO: chi e' gia' seduto
+ *   non "annulla" la prenotazione ma "esce" (vedi effettua_checkout).
+ *
+ * Parametri:
+ *   anagrafica, aula, coda, matricola: non NULL.
+ *   ora_attuale: timestamp virtuale per lo storico.
+ *
+ * Pre:  sistema inizializzato.
+ * Post: vedi scenari sopra. Storico aggiornato in ogni caso di successo.
+ */
+void annulla_prenotazione(TabellaHashStudenti* anagrafica, TurnoAula* aula, CodaAttesa* coda, char* matricola, OrarioVirtuale ora_attuale) {
+    if (aula == NULL || coda == NULL || matricola == NULL) return;
+
+    /* Scenario A: posto fisico assegnato in stato PRENOTATO. */
+    for (int i = 0; i < MAX_POSTI; i++) {
+        if (aula->posti[i].stato == PRENOTATO && strcmp(aula->posti[i].matricola_studente, matricola) == 0) {
+
+            printf("[SISTEMA] Annullamento prenotazione per la matricola %s...\n", matricola);
+            salva_storico_accesso(anagrafica, matricola, "ANNULLAMENTO PRENOTAZIONE", ora_attuale);
+
+            /* Cerca un subentrante con fascia compatibile, come in effettua_checkout. */
+            {
+                NodoAttesa* curr = coda->head;
+                NodoAttesa* prev = NULL;
+                NodoAttesa* subentrante = NULL;
+
+                while (curr != NULL) {
+                    if (curr->fascia == aula->fascia) {
+                        subentrante = curr;
+                        if (prev == NULL) coda->head = curr->next;
+                        else              prev->next  = curr->next;
+                        if (coda->tail == curr) coda->tail = prev;
+                        coda->dimensione--;
+                        break;
+                    }
+                    prev = curr;
+                    curr = curr->next;
+                }
+
+                if (subentrante != NULL) {
+                    /* Sostituzione "atomica": un utente prende il posto dell'altro,
+                     * il conteggio posti_occupati non cambia. */
+                    strncpy(aula->posti[i].matricola_studente, subentrante->matricola, 11);
+                    aula->posti[i].matricola_studente[11] = '\0';
+                    aula->posti[i].stato = PRENOTATO;
+                    aula->posti[i].ora_prenotazione = ora_attuale;
+
+                    printf("[SUBENTRO] Posto %d assegnato a %s dalla coda (fascia %s).\n",
+                           i + 1, subentrante->matricola,
+                           (aula->fascia == MATTINA ? "MATTINA" : aula->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+                    salva_storico_accesso(anagrafica, subentrante->matricola, "SUBENTRO DA CODA (DOPO ANNULLAMENTO)", ora_attuale);
+                    free(subentrante);
+                } else {
+                    /* Nessun subentrante: il posto torna realmente LIBERO. */
+                    aula->posti[i].stato = LIBERO;
+                    strcpy(aula->posti[i].matricola_studente, "");
+                    if (aula->posti_occupati > 0) aula->posti_occupati--;
+                    printf("[SISTEMA] Posto %d liberato. Nessun subentrante compatibile in coda.\n", i + 1);
+                }
+            }
+            return;
+        }
+    }
+
+    /* Scenario B: prenotazione anticipata (lo studente e' in coda, non in un posto).
+     * In questo caso vogliamo anche decrementare totale_prenotazioni: la
+     * prenotazione anticipata e' stata contata al momento dell'inserimento
+     * in coda (vedi effettua_prenotazione, ramo "fascia futura"). */
+    {
+        NodoAttesa* curr = coda->head;
+        NodoAttesa* prev = NULL;
+
+        while (curr != NULL) {
+            if (strcmp(curr->matricola, matricola) == 0) {
+                if (prev == NULL) coda->head = curr->next;
+                else              prev->next  = curr->next;
+                if (coda->tail == curr) coda->tail = prev;
+                coda->dimensione--;
+
+                printf("[SISTEMA] Prenotazione anticipata per fascia %s annullata per %s.\n",
+                       (curr->fascia == MATTINA ? "MATTINA"
+                       : curr->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"),
+                       matricola);
+                salva_storico_accesso(anagrafica, matricola,
+                                      "ANNULLAMENTO PRENOTAZIONE ANTICIPATA", ora_attuale);
+                free(curr);
+
+                if (aula->totale_prenotazioni > 0) aula->totale_prenotazioni--;
+                return;
+            }
+            prev = curr;
+            curr = curr->next;
+        }
+    }
+
+    printf("[ERRORE] Nessuna prenotazione trovata per la matricola %s.\n", matricola);
+}
+
+/*
+ * visualizza_studenti_per_stato:
+ *   Stampa l'elenco nominativo degli studenti suddivisi in tre categorie:
+ *     - PRESENTI: stato OCCUPATO;
+ *     - PRENOTATI: stato PRENOTATO (atteso, non ancora arrivato);
+ *     - IN CODA: presenti nella lista d'attesa.
+ *
+ *   Per ogni studente vengono mostrati matricola, nome e corso di laurea
+ *   recuperati dall'anagrafica tramite cerca_studente. Se l'anagrafica
+ *   non ha quei dati (es. matricola fittizia inserita dai test) si
+ *   stampa un placeholder, senza terminare in errore.
+ *
+ * Parametri:
+ *   anagrafica, aula, coda: non NULL.
+ *
+ * Pre:  sistema inizializzato.
+ * Post: nessuna modifica alle strutture; output su stdout.
+ */
+void visualizza_studenti_per_stato(TabellaHashStudenti* anagrafica, TurnoAula* aula, CodaAttesa* coda) {
+    int i;
+    int trovati;
+    Studente* s;
+
+    printf("\n+==========================================+\n");
+    printf("|       ELENCO STUDENTI PER STATO         |\n");
+    printf("+==========================================+\n");
+
+    /* Presenti: solo posti OCCUPATO. */
+    printf("\n[PRESENTI (check-in effettuato)]:\n");
+    trovati = 0;
+    for (i = 0; i < MAX_POSTI; i++) {
+        if (aula->posti[i].stato == OCCUPATO) {
+            trovati++;
+            s = cerca_studente(anagrafica, aula->posti[i].matricola_studente);
+            if (s != NULL)
+                printf("  [Posto %3d] %-12s | %-30s | %s\n",
+                       i+1,
+                       aula->posti[i].matricola_studente,
+                       s->nome,
+                       s->corso_di_laurea);
+            else
+                printf("  [Posto %3d] %-12s | (anagrafica non disponibile)\n",
+                       i+1, aula->posti[i].matricola_studente);
+        }
+    }
+    if (trovati == 0) printf("  Nessuno presente.\n");
+
+    /* Prenotati: posti PRENOTATO, con orario in cui e' stata fatta la prenotazione. */
+    printf("\n[PRENOTATI (non ancora arrivati)]:\n");
+    trovati = 0;
+    for (i = 0; i < MAX_POSTI; i++) {
+        if (aula->posti[i].stato == PRENOTATO) {
+            trovati++;
+            s = cerca_studente(anagrafica, aula->posti[i].matricola_studente);
+            if (s != NULL)
+                printf("  [Posto %3d] %-12s | %-30s | %s  (prenotato alle %02d:%02d)\n",
+                       i+1,
+                       aula->posti[i].matricola_studente,
+                       s->nome,
+                       s->corso_di_laurea,
+                       aula->posti[i].ora_prenotazione.ora,
+                       aula->posti[i].ora_prenotazione.minuti);
+            else
+                printf("  [Posto %3d] %-12s | (anagrafica non disponibile) (prenotato alle %02d:%02d)\n",
+                       i+1,
+                       aula->posti[i].matricola_studente,
+                       aula->posti[i].ora_prenotazione.ora,
+                       aula->posti[i].ora_prenotazione.minuti);
+        }
+    }
+    if (trovati == 0) printf("  Nessun prenotato in attesa di arrivo.\n");
+
+    /* In coda: scorrimento sequenziale della lista d'attesa con indice
+     * di posizione (1-based, piu' leggibile per l'utente finale). */
+    printf("\n[IN LISTA D'ATTESA (%d in coda)]:\n", coda->dimensione);
+    {
+        NodoAttesa* curr = coda->head;
+        int pos = 1;
+        if (curr == NULL) printf("  Nessuno in coda.\n");
+        while (curr != NULL) {
+            s = cerca_studente(anagrafica, curr->matricola);
+            if (s != NULL)
+                printf("  [#%d] %-12s | %-30s | %s  (Fascia: %s)\n",
+                       pos, curr->matricola, s->nome, s->corso_di_laurea,
+                       (curr->fascia == MATTINA ? "MATTINA"
+                      : curr->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+            else
+                printf("  [#%d] %-12s | (anagrafica non disponibile)\n",
+                       pos, curr->matricola);
+            curr = curr->next;
+            pos++;
+        }
+    }
+    printf("===========================================\n");
+}
