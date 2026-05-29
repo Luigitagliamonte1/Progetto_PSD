@@ -1580,3 +1580,624 @@ void visualizza_studenti_per_stato(TabellaHashStudenti* anagrafica, TurnoAula* a
     }
     printf("===========================================\n");
 }
+
+/* ==========================================================================
+ * PERSISTENZA SU FILE
+ * ========================================================================== */
+
+/*
+ * salva_storico_accesso:
+ *   Aggiunge una riga al file storico_accessi.txt con timestamp, dati
+ *   anagrafici dello studente (se reperibili) e tipo di operazione.
+ *
+ *   Il file viene aperto in append ("a") ad ogni chiamata. E' una scelta
+ *   semplice ma costosa in I/O; per i volumi previsti dall'applicazione
+ *   (operazioni manuali) e' accettabile e ha il pregio di garantire la
+ *   persistenza anche se il programma viene chiuso bruscamente.
+ *
+ *   Se l'anagrafica e' NULL o lo studente non viene trovato, si usa un
+ *   fallback con "N/D" nei campi nome/corso: questo permette di loggare
+ *   eventi automatici (es. NO-SHOW a fine turno) anche quando il chiamante
+ *   non ha sotto mano la tabella hash.
+ *
+ * Parametri:
+ *   anagrafica: puo' essere NULL (vedi sopra).
+ *   matricola, operazione: stringhe valide.
+ *   ora: timestamp virtuale.
+ *
+ * Pre:  il file storico_accessi.txt deve essere accessibile in scrittura
+ *       nella directory di lavoro (altrimenti viene segnalato errore).
+ * Post: una nuova riga e' stata aggiunta in fondo al file, oppure errore
+ *       su stderr.
+ */
+void salva_storico_accesso(TabellaHashStudenti* anagrafica, char* matricola, char* operazione, OrarioVirtuale ora) {
+    FILE *fp = fopen("storico_accessi.txt", "a");
+    if (fp == NULL) {
+        fprintf(stderr, "[ERRORE] Impossibile aprire storico_accessi.txt in scrittura.\n");
+        return;
+    }
+
+    /* Lookup difensivo: se non ho l'anagrafica, salto il cerca_studente. */
+    Studente* s = (anagrafica != NULL) ? cerca_studente(anagrafica, matricola) : NULL;
+
+    if (s != NULL) {
+        fprintf(fp, "[%02d:%02d:%02d] Matricola: %-12s | Nome: %-30s | Corso: %-30s | Azione: %s\n",
+                ora.ora, ora.minuti, ora.secondi,
+                matricola, s->nome, s->corso_di_laurea, operazione);
+    } else {
+        /* Fallback: scriviamo comunque la riga per non perdere l'evento. */
+        fprintf(fp, "[%02d:%02d:%02d] Matricola: %-12s | Nome: N/D                            | Corso: N/D                            | Azione: %s\n",
+                ora.ora, ora.minuti, ora.secondi, matricola, operazione);
+    }
+    fclose(fp);
+}
+
+/*
+ * visualizza_storico_accessi:
+ *   Legge tutto il file storico_accessi.txt e lo stampa a video riga per
+ *   riga. Se il file non esiste lo segnala in modo non bloccante: non e'
+ *   un errore, semplicemente non ci sono ancora eventi registrati.
+ *
+ * Pre:  -
+ * Post: nessuna modifica al file ne' alle strutture; output su stdout.
+ */
+void visualizza_storico_accessi() {
+    FILE *fp = fopen("storico_accessi.txt", "r");
+    if (fp == NULL) {
+        printf("\n[INFO] Nessuno storico trovato (file non presente).\n");
+        return;
+    }
+
+    printf("\n--- STORICO ACCESSI ---\n");
+    char riga[200];   /* buffer dimensionato in base alla riga massima prodotta da salva_storico_accesso */
+    while (fgets(riga, sizeof(riga), fp) != NULL) {
+        printf("%s", riga);
+    }
+    printf("-----------------------\n");
+    fclose(fp);
+}
+
+/* ==========================================================================
+ * MENU E GESTIONE RISORSE
+ * ========================================================================== */
+
+/*
+ * mostra_menu:
+ *   Stampa il menu testuale principale dell'applicazione. Non legge input:
+ *   la lettura della scelta e' responsabilita' del main.
+ */
+void mostra_menu() {
+    printf("\n--- GESTIONE AULA STUDIO ---\n");
+    printf("1. Registra Studente\n");
+    printf("2. Effettua Prenotazione\n");
+    printf("3. Check-in (Ingresso)\n");
+    printf("4. Check-out (Uscita)\n");
+    printf("5. Visualizza Studenti (Presenti/Prenotati/Coda)\n");
+    printf("6. Annulla Prenotazione\n");
+    printf("7. Report Stato Aula e Storico\n");
+    printf("8. Test Automatico\n");
+    printf("0. Esci\n");
+    printf("Scelta: ");
+}
+
+/*
+ * libera_risorse:
+ *   Rilascia tutta la memoria allocata dinamicamente dal sistema.
+ *   Da chiamare una sola volta in chiusura del programma per evitare
+ *   memory leak.
+ *
+ *   Ordine di liberazione:
+ *     1. Tutti i nodi di ogni bucket della tabella hash.
+ *     2. Tutti i nodi della coda d'attesa.
+ *     3. Le tre struct principali (tabella, aula, coda), che sono state
+ *        allocate con malloc da inizializza_sistema_dinamico.
+ *
+ *   Dopo la free dei bucket vengono azzerati i puntatori di testa per
+ *   evitare dangling pointer in caso di uso accidentale post-cleanup.
+ *
+ * Parametri:
+ *   t, aula, coda: possono essere NULL (in tal caso si esce senza fare nulla).
+ *
+ * Pre:  -
+ * Post: tutta la memoria delle strutture passate e' liberata.
+ */
+void libera_risorse(TabellaHashStudenti* t, TurnoAula* aula, CodaAttesa* coda) {
+    if (t == NULL || coda == NULL) return;
+
+    printf("\n[CLEANUP] Inizio rilascio memoria...\n");
+
+    /* Tabella hash: per ogni bucket, libera l'intera lista concatenata. */
+    for (int i = 0; i < BUCKETS; i++) {
+        NodoStudente* curr = t->tabella[i];
+        while (curr != NULL) {
+            NodoStudente* temp = curr;
+            curr = curr->next;
+            free(temp);
+        }
+        t->tabella[i] = NULL; /* protezione contro dangling pointer */
+    }
+    printf("  - Anagrafica (Hash Table) liberata.\n");
+
+    /* Coda d'attesa: scorrimento e free di ogni nodo. */
+    NodoAttesa* curr_coda = coda->head;
+    while (curr_coda != NULL) {
+        NodoAttesa* temp = curr_coda;
+        curr_coda = curr_coda->next;
+        free(temp);
+    }
+
+    /* Reset della struct Coda (utile se il chiamante non libera subito coda). */
+    coda->head = NULL;
+    coda->tail = NULL;
+    coda->dimensione = 0;
+
+    printf("  - Coda d'Attesa liberata.\n");
+
+    /* Strutture principali allocate da inizializza_sistema_dinamico. */
+    free(t);
+    free(aula);
+    free(coda);
+
+    printf("[CLEANUP] Memoria pulita correttamente. Arrivederci!\n");
+}
+
+/*
+ * svuota_coda:
+ *   Libera tutti i nodi della coda d'attesa lasciandola vuota ma valida
+ *   (head/tail NULL, dimensione 0). Usata principalmente:
+ *     - tra un test e l'altro in esegui_test_completo per partire pulito;
+ *     - in eventuali reset manuali.
+ *
+ *   Nota: per il cambio fascia normale si usa una logica selettiva
+ *   (vedi cambio_fascia_automatica) e NON questa funzione, perche'
+ *   bisogna preservare le prenotazioni anticipate per i turni futuri.
+ *
+ * Parametri:
+ *   coda: puo' essere NULL.
+ *
+ * Pre:  -
+ * Post: coda vuota e coerente.
+ */
+void svuota_coda(CodaAttesa* coda) {
+    if (coda == NULL) return;
+    NodoAttesa* curr = coda->head;
+    while (curr != NULL) {
+        NodoAttesa* temp = curr;
+        curr = curr->next;
+        free(temp);
+    }
+    coda->head = NULL;
+    coda->tail = NULL;
+    coda->dimensione = 0;
+}
+
+/* ==========================================================================
+ * GESTIONE DELL'ORARIO VIRTUALE
+ * ========================================================================== */
+
+/*
+ * orario_in_secondi:
+ *   Converte un OrarioVirtuale in secondi assoluti dalla mezzanotte.
+ *   Utile per confronti numerici diretti (range delle fasce orarie).
+ *
+ * Parametri:
+ *   o: orario virtuale.
+ *
+ * Ritorna:
+ *   Il numero di secondi trascorsi dalla mezzanotte, come long.
+ *   Il cast a long e' su 'ora' perche' o.ora * 3600 potrebbe stare
+ *   stretto in int su piattaforme con int a 16 bit (qui non e' un
+ *   problema reale, ma e' una buona abitudine).
+ */
+long orario_in_secondi(OrarioVirtuale o) {
+    return (long)o.ora * 3600 + o.minuti * 60 + o.secondi;
+}
+
+/*
+ * is_orario_valido:
+ *   Verifica se un orario virtuale ricade nei limiti definiti per una
+ *   data fascia oraria:
+ *     - MATTINA:    09:00 - 13:00
+ *     - POMERIGGIO: 14:00 - 18:00
+ *     - SERA:       18:00 - 22:00
+ *
+ *   I confronti sono fatti in secondi dalla mezzanotte (vedi
+ *   orario_in_secondi) per evitare condizioni a piu' componenti.
+ *
+ * Parametri:
+ *   adesso: l'orario da verificare.
+ *   fascia: la fascia di riferimento.
+ *
+ * Ritorna:
+ *   1 se l'orario ricade nella fascia, 0 altrimenti.
+ */
+int is_orario_valido(OrarioVirtuale adesso, FasciaOraria fascia) {
+    long s = orario_in_secondi(adesso);
+
+    if (fascia == MATTINA) {
+        return (s >= 32400 && s <= 46800);   /* 09:00 - 13:00 */
+    }
+    else if (fascia == POMERIGGIO) {
+        return (s >= 50400 && s <= 64800);   /* 14:00 - 18:00 */
+    }
+    else if (fascia == SERA) {
+        return (s >= 64800 && s <= 79200);   /* 18:00 - 22:00 */
+    }
+    return 0;
+}
+
+/* ==========================================================================
+ * RICERCA IN HASH (definizione)
+ * ========================================================================== */
+
+/*
+ * cerca_studente:
+ *   Cerca uno studente in tabella hash data la matricola.
+ *
+ *   Strategia:
+ *     1. Calcolare l'indice del bucket via calcola_hash.
+ *     2. Scorrere la lista del bucket confrontando le matricole con strcmp.
+ *     3. Ritornare il puntatore al primo match (matricole sono uniche
+ *        per costruzione, grazie al controllo in inserisci_studente).
+ *
+ * Parametri:
+ *   t: tabella hash (NULL ammesso).
+ *   matricola: stringa (NULL ammesso).
+ *
+ * Ritorna:
+ *   Puntatore allo Studente trovato (vivo dentro un nodo della tabella),
+ *   oppure NULL se non trovato o parametri NULL.
+ */
+Studente* cerca_studente(TabellaHashStudenti* t, char* matricola) {
+    if (t == NULL || matricola == NULL) return NULL;
+    int indice = calcola_hash(matricola);
+    NodoStudente* curr = t->tabella[indice];
+    while (curr != NULL) {
+        if (strcmp(curr->dati.matricola, matricola) == 0) return &(curr->dati);
+        curr = curr->next;
+    }
+    return NULL;
+}
+
+/* ==========================================================================
+ * GETTER PER INFORMATION HIDING
+ * ---------------------------------------------------------------------------
+ * Necessari perche' TurnoAula e CodaAttesa sono tipi opachi: il main
+ * non puo' fare aula->fascia o coda->dimensione direttamente. Tutti i
+ * getter sono difensivi sui NULL e restituiscono valori "neutri" in caso
+ * di errore, in modo che il chiamante non sia costretto a sparpagliare
+ * controlli NULL ovunque.
+ * ========================================================================== */
+
+/* Ritorna la fascia oraria corrente dell'aula (default MATTINA se NULL). */
+FasciaOraria get_fascia_aula(TurnoAula* aula) {
+    if (aula == NULL) return MATTINA;
+    return aula->fascia;
+}
+
+/* Ritorna il numero totale di posti impegnati (PRENOTATO + OCCUPATO). */
+int get_posti_occupati_totali(TurnoAula* aula) {
+    if (aula == NULL) return 0;
+    return aula->posti_occupati;
+}
+
+/* Ritorna il numero di studenti nella lista d'attesa. */
+int get_dimensione_coda(CodaAttesa* coda) {
+    if (coda == NULL) return 0;
+    return coda->dimensione;
+}
+
+/* Ritorna la stringa della data del turno corrente (NULL se aula NULL). */
+char* get_data_aula(TurnoAula* aula) {
+    if (aula == NULL) return NULL;
+    return aula->data;
+}
+
+/*
+ * inizializza_sistema_dinamico:
+ *   Variante "tutto-in-uno" di inizializza_sistema: alloca dinamicamente
+ *   le tre strutture e poi le inizializza.
+ *
+ *   Riceve TRE puntatori a puntatore (doppi puntatori) perche' deve
+ *   poter modificare la variabile puntatore del chiamante, non solo
+ *   quello che essa indirizza. Questo e' necessario perche' il main non
+ *   puo' allocare direttamente le struct opache (non ne conosce le
+ *   dimensioni, per il principio dell'information hiding).
+ *
+ *   In caso di fallimento di una qualsiasi malloc esce con exit(1):
+ *   l'applicazione non puo' proseguire senza queste strutture, e
+ *   provare a "ripiegare" produrrebbe solo segfault successivi.
+ *
+ * Parametri:
+ *   t, aula, coda: puntatori a variabili-puntatore allocate dal chiamante
+ *                  (tipicamente sullo stack), inizialmente NULL.
+ *
+ * Pre:  i tre parametri sono non NULL (sono indirizzi di variabili valide).
+ * Post: *t, *aula, *coda puntano a strutture allocate e inizializzate.
+ */
+void inizializza_sistema_dinamico(TabellaHashStudenti** t, TurnoAula** aula, CodaAttesa** coda) {
+    *t    = (TabellaHashStudenti*)malloc(sizeof(TabellaHashStudenti));
+    *aula = (TurnoAula*)malloc(sizeof(TurnoAula));
+    *coda = (CodaAttesa*)malloc(sizeof(CodaAttesa));
+
+    if (*t == NULL || *aula == NULL || *coda == NULL) {
+        fprintf(stderr, "[ERRORE CRITICO] Impossibile allocare le strutture principali.\n");
+        exit(1);
+    }
+
+    /* Delega l'inizializzazione dei campi alla versione "non dinamica". */
+    inizializza_sistema(*t, *aula, *coda);
+}
+
+
+/*
+ * cambio_fascia_automatica:
+ *   Chiude il turno corrente e prepara l'aula per la nuova fascia.
+ *
+ *   Fasi eseguite, nell'ordine:
+ *
+ *     1. Conteggio no-show: i posti ancora PRENOTATO a fine turno
+ *        rappresentano studenti che non si sono mai presentati. Vengono
+ *        contati e loggati. I posti OCCUPATO (qualcuno ancora dentro)
+ *        ricevono un "checkout forzato" loggato come tale.
+ *
+ *     2. Pulizia selettiva della coda: vengono RIMOSSI solo i nodi con
+ *        fascia == fascia appena conclusa. I nodi con fascia futura
+ *        (prenotazioni anticipate per turni successivi) restano in coda.
+ *        Questa logica selettiva e' il motivo per cui qui non usiamo
+ *        svuota_coda, che azzererebbe tutto.
+ *
+ *     3. Reset dei contatori statistici del turno e dei posti fisici.
+ *        La fascia viene aggiornata DOPO il conteggio dei no-show
+ *        (altrimenti il log conterrebbe la fascia sbagliata).
+ *
+ *     4. Promozione FIFO: i nodi rimasti in coda con fascia == nuova_fascia
+ *        ottengono automaticamente un posto fisico (PRENOTATO), in ordine
+ *        di inserimento, fino a riempire i posti disponibili.
+ *
+ * Parametri:
+ *   aula, coda: non NULL.
+ *   nuova_fascia: la fascia successiva (di solito POMERIGGIO o SERA).
+ *
+ * Pre:  nuova_fascia != aula->fascia (chiamata solo a fronte di un vero
+ *       cambio).
+ * Post: aula azzerata e nella nuova fascia; coda epurata dei nodi della
+ *       fascia conclusa e con i suoi nodi futuri (compatibili) promossi
+ *       ai posti dell'aula.
+ */
+void cambio_fascia_automatica(TurnoAula* aula, CodaAttesa* coda, FasciaOraria nuova_fascia) {
+    /* Usiamo ora_zero per tutti gli eventi automatici: il timestamp reale
+     * non sarebbe significativo, perche' l'evento dipende dal cambio fascia,
+     * non dal momento esatto. */
+    OrarioVirtuale ora_zero = {0, 0, 0};
+
+    printf("\n[SISTEMA] Cambio fascia rilevato! Chiusura turno: %s -> %s\n",
+           (aula->fascia == MATTINA ? "MATTINA" : (aula->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA")),
+           (nuova_fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+
+    /* --- 1. Conteggio no-show e checkout forzati. --- */
+    for (int i = 0; i < MAX_POSTI; i++) {
+        if (aula->posti[i].stato == PRENOTATO) {
+            /* Prenotato che non si e' presentato: no-show. */
+            aula->totale_no_show++;
+            salva_storico_accesso(NULL, aula->posti[i].matricola_studente, "NO-SHOW (FINE TURNO)", ora_zero);
+        } else if (aula->posti[i].stato == OCCUPATO) {
+            /* Ancora dentro a fine turno: checkout forzato. */
+            salva_storico_accesso(NULL, aula->posti[i].matricola_studente, "CHECKOUT AUTOMATICO (FINE TURNO)", ora_zero);
+        }
+        aula->posti[i].stato = LIBERO;
+        strcpy(aula->posti[i].matricola_studente, "");
+    }
+
+    /* --- 2. Pulizia selettiva della coda. --- */
+    {
+        const char* fascia_conclusa = (aula->fascia == MATTINA ? "MATTINA"
+                                     : aula->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA");
+        const char* fascia_nuova    = (nuova_fascia == MATTINA ? "MATTINA"
+                                     : nuova_fascia == POMERIGGIO ? "POMERIGGIO" : "SERA");
+        int n_espulsi = 0;
+        int n_rimasti = 0;
+
+        NodoAttesa* curr = coda->head;
+        NodoAttesa* prev = NULL;
+        while (curr != NULL) {
+            /* Salviamo next prima di un possibile free, altrimenti perderemmo
+             * il riferimento al resto della catena. */
+            NodoAttesa* next = curr->next;
+            if (curr->fascia == aula->fascia) {
+                /* Nodo della fascia conclusa: viene rimosso e contato. */
+                aula->totale_espulsi_da_coda++;
+                n_espulsi++;
+                salva_storico_accesso(NULL, curr->matricola,
+                                      "ESPULSO DA CODA (FINE TURNO)", ora_zero);
+                printf("  [RIMOSSO] %s era in coda per %s (turno concluso).\n",
+                       curr->matricola, fascia_conclusa);
+                if (prev == NULL) coda->head = next;
+                else              prev->next  = next;
+                if (coda->tail == curr) coda->tail = prev;
+                coda->dimensione--;
+                free(curr);
+            } else {
+                /* Nodo di fascia futura: resta in coda, sara' processato
+                 * al cambio fascia corrispondente o nella fase di promozione. */
+                n_rimasti++;
+                printf("  [MANTENUTO] %s rimane in coda per la fascia %s.\n",
+                       curr->matricola,
+                       (curr->fascia == MATTINA ? "MATTINA"
+                       : curr->fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+                prev = curr;
+            }
+            curr = next;
+        }
+
+        printf("[CODA] Pulizia completata: %d rimossi (fascia %s), %d mantenuti per %s.\n",
+               n_espulsi, fascia_conclusa, n_rimasti, fascia_nuova);
+    }
+
+    /* --- 3. Reset di posti e contatori. --- */
+    {
+        int i;
+        for (i = 0; i < MAX_POSTI; i++) {
+            aula->posti[i].stato = LIBERO;
+            memset(aula->posti[i].matricola_studente, 0, 12);
+        }
+    }
+    aula->posti_occupati         = 0;
+    aula->totale_prenotazioni    = 0;
+    aula->totale_checkin         = 0;
+    aula->totale_checkout        = 0;
+    aula->totale_no_show         = 0;
+    aula->totale_espulsi_da_coda = 0;
+
+    /* Solo ora possiamo aggiornare la fascia: i log della fase 1 e 2
+     * usavano la fascia "vecchia" come riferimento. */
+    aula->fascia = nuova_fascia;
+
+    /* --- 4. Promozione FIFO dalla coda alla nuova fascia. --- */
+    {
+        int promossi = 0;
+        NodoAttesa* curr = coda->head;
+        NodoAttesa* prev = NULL;
+
+        while (curr != NULL && aula->posti_occupati < MAX_POSTI) {
+            NodoAttesa* next = curr->next;
+            if (curr->fascia == nuova_fascia) {
+                /* Cerca il primo posto LIBERO (sicuramente esiste, perche'
+                 * abbiamo appena resettato tutto e c'e' spazio). */
+                int i;
+                for (i = 0; i < MAX_POSTI; i++) {
+                    if (aula->posti[i].stato == LIBERO) {
+                        OrarioVirtuale ora_zero = {0, 0, 0};
+                        aula->posti[i].stato = PRENOTATO;
+                        strncpy(aula->posti[i].matricola_studente, curr->matricola, 11);
+                        aula->posti[i].matricola_studente[11] = '\0';
+                        aula->posti[i].ora_prenotazione = ora_zero;
+                        aula->posti_occupati++;
+                        aula->totale_prenotazioni++;
+                        promossi++;
+
+                        printf("  [PROMOSSO] %s: dalla coda al posto %d per fascia %s.\n",
+                               curr->matricola, i + 1,
+                               (nuova_fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+
+                        /* Rimuove il nodo promosso dalla coda. */
+                        if (prev == NULL) coda->head = next;
+                        else              prev->next  = next;
+                        if (coda->tail == curr) coda->tail = prev;
+                        coda->dimensione--;
+                        free(curr);
+                        break;
+                    }
+                }
+            } else {
+                /* Nodo di fascia ancora piu' futura: resta in coda. */
+                prev = curr;
+            }
+            curr = next;
+        }
+
+        if (promossi > 0)
+            printf("[SISTEMA] %d studenti promossi dalla coda ai posti per fascia %s.\n",
+                   promossi, (nuova_fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+    }
+
+    printf("[SISTEMA] Aula pronta per i nuovi ingressi. Fascia: %s\n",
+           (nuova_fascia == POMERIGGIO ? "POMERIGGIO" : "SERA"));
+}
+
+/*
+ * aggiorna_orario_automatico:
+ *   Avanza l'orario virtuale in base al tempo reale trascorso dall'ultima
+ *   chiamata e innesca il cambio fascia quando si sconfina nelle ore
+ *   appropriate.
+ *
+ *   Scala temporale: 1 secondo reale = 120 secondi virtuali (2 minuti).
+ *   Questo permette di simulare un'intera giornata in circa 12 minuti
+ *   reali, utile per testing/demo interattiva.
+ *
+ *   Il ciclo for di incremento e' scritto secondo per secondo (e non con
+ *   un piu' semplice modulo aritmetico) per essere robusto rispetto a
+ *   eventuali "balzi" dell'orario: in caso di sleep lungo, l'avanzamento
+ *   passa comunque attraverso tutte le soglie intermedie.
+ *
+ * Parametri:
+ *   ora: orario virtuale corrente, modificato in place.
+ *   ultimo_aggiornamento: timestamp reale dell'ultima chiamata, modificato
+ *                         in place.
+ *   aula, coda: serviti a cambio_fascia_automatica in caso di cambio fascia.
+ *
+ * Pre:  tutti i puntatori non NULL.
+ * Post: l'orario virtuale e' avanzato; eventuale cambio fascia gestito.
+ */
+void aggiorna_orario_automatico(OrarioVirtuale* ora, time_t* ultimo_aggiornamento, TurnoAula* aula, CodaAttesa* coda) {
+    time_t tempo_reale_ora = time(NULL);
+    double secondi_trascorsi = difftime(tempo_reale_ora, *ultimo_aggiornamento);
+
+    /* Aggiorniamo solo se e' passato almeno 1 secondo reale: evita
+     * incrementi di precisione sub-secondo che non aggiungerebbero
+     * informazione utile. */
+    if (secondi_trascorsi >= 1.0) {
+        int secondi_da_aggiungere = (int)secondi_trascorsi * 120;
+
+        for(int i = 0; i < secondi_da_aggiungere; i++) {
+            ora->secondi++;
+            if (ora->secondi >= 60) { ora->secondi = 0; ora->minuti++; }
+            if (ora->minuti  >= 60) { ora->minuti  = 0; ora->ora++;    }
+            if (ora->ora     >= 24) { ora->ora     = 0;                 }
+        }
+
+        *ultimo_aggiornamento = tempo_reale_ora;
+
+        /* Controllo cambio fascia. La condizione e' "robusta per tempi veloci":
+         *   - MATTINA -> POMERIGGIO scatta in [13:00, 18:00);
+         *   - POMERIGGIO -> SERA scatta in [18:00, 09:00) (cioe' anche dopo
+         *     mezzanotte, finche' non si torna in mattina).
+         * Cosi' anche se l'aggiornamento "salta" qualche ora, il cambio
+         * fascia avviene comunque. */
+        if (ora->ora >= 13 && ora->ora < 18 && aula->fascia == MATTINA) {
+            cambio_fascia_automatica(aula, coda, POMERIGGIO);
+        }
+        else if ((ora->ora >= 18 || ora->ora < 9) && aula->fascia == POMERIGGIO) {
+            cambio_fascia_automatica(aula, coda, SERA);
+        }
+    }
+}
+
+/*
+ * visualizza_situazione_corrente:
+ *   Stampa una vista compatta dello stato dell'aula (chi e' presente,
+ *   chi e' prenotato) e della coda d'attesa, identificando ciascuno per
+ *   numero di posto e matricola. Versione "leggera" rispetto a
+ *   visualizza_studenti_per_stato, che riporta anche nome e corso.
+ *
+ * Parametri:
+ *   aula, coda: non NULL.
+ *
+ * Pre:  sistema inizializzato.
+ * Post: nessuna modifica alle strutture; output su stdout.
+ */
+void visualizza_situazione_corrente(TurnoAula* aula, CodaAttesa* coda) {
+    printf("\n--- STUDENTI ATTUALMENTE IN AULA ---\n");
+    int cont = 0;
+    for (int i = 0; i < MAX_POSTI; i++) {
+        if (aula->posti[i].stato == OCCUPATO) {
+            printf("Posto %d: %s [PRESENTE]\n", i+1, aula->posti[i].matricola_studente);
+            cont++;
+        } else if (aula->posti[i].stato == PRENOTATO) {
+            printf("Posto %d: %s [PRENOTATO - ARRIVO PREVISTO]\n", i+1, aula->posti[i].matricola_studente);
+            cont++;
+        }
+    }
+    if (cont == 0) printf("L'aula e' attualmente vuota.\n");
+
+    printf("\n--- STUDENTI IN CODA D'ATTESA ---\n");
+    if (coda->head == NULL) {
+        printf("Nessuno in attesa.\n");
+    } else {
+        NodoAttesa* temp = coda->head;
+        while (temp) {
+            printf("- Studente: %s\n", temp->matricola);
+            temp = temp->next;
+        }
+    }
+}
